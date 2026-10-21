@@ -1,4 +1,4 @@
-# Android Rescue for macOS — v2.1.0
+# Android Rescue for macOS — v2.1.1
 
 For implementation details and limitations, see [ARCHITECTURE.md](ARCHITECTURE.md). Contributors should read [AGENTS.md](AGENTS.md).
 
@@ -187,7 +187,7 @@ python3 android_rescue.py \
   --serial PHONE_IP:ADB_PORT
 ```
 
-Already completed files recorded in the case database are skipped if their local copy still exists. Failed/pending files are retryable.
+Completed storage files and APKs are skipped only when their size and SHA-256 match the integrity record saved after copying. Missing or modified copies are recopied. Older cases without integrity records remain compatible, but their files are recopied once to establish those records. Failed/pending files are retryable. This is file-level resume, not continuation from a byte offset. Integrity checks validate the saved local copy; they do not detect later source changes or prove equality with a source-side hash.
 
 The tool compares the resumed phone's identity with the stored case identity and refuses an obvious device mismatch unless you intentionally use `--force-resume`.
 
@@ -303,7 +303,7 @@ Keep the source phone until critical rescued material has been independently ope
 --no-providers
 --bugreport
 --no-bugreport
---no-hash
+--no-hash  (skip export manifests; resume integrity hashes remain enabled)
 --pull-timeout SECONDS
 --authorized
 --version
@@ -332,7 +332,7 @@ If the phone is stable, Auto mode is simpler.
 
 ## Validation performed on this build
 
-The supplied v2.1.0 script was:
+The supplied v2.1.1 script was:
 
 - Python syntax/bytecode compiled successfully.
 - Exercised against a simulated Android storage tree.
@@ -343,3 +343,12 @@ The supplied v2.1.0 script was:
 - Tested to ensure timed-out child transfer processes are terminated.
 
 Real-device behavior still depends on the Android version, OEM restrictions, unlocked profiles, permissions granted to ADB, and the health of the source device.
+
+## Reliability fixes and current checks — v2.1.1
+
+- Partial/failed storage scans and requested export failures appear in `reports/failures.csv`; open items return exit code 2 rather than clean success. Usable copied files are preserved. A successful recursive fallback is conservatively reported as unverified because it lacks per-file indexing.
+- Resume validates local size and SHA-256 for storage files/APKs, including same-size corruption. This adds local disk reads. `--no-hash` disables exported manifests, not resume-integrity records.
+- Private-app archives are written to `.partial` staging files, read through all TAR member payloads, then promoted and given a size/hash completion receipt. Interrupted/unverified archives are retried; they are never accepted merely because a nonempty file exists.
+- Final manifests are regenerated after acquisition metadata is finalized. Stopped/failed runs remove stale manifests; completing without final hashing also removes earlier manifests.
+- Nine synthetic regression tests passed on 2026-10-21. Run: `python3 -B -m unittest discover -s android-rescue-local/tests -v` from the parent directory (or `python3 -B -m unittest discover -s tests -v` here). Coverage includes copying, retries, collisions, legacy resume, corruption, archive interruption/truncation, scan failures, provider denials, final checksums and no-manifest mode.
+- CLI version and shell syntax checks passed. No real-phone acquisition was performed for these fixes.

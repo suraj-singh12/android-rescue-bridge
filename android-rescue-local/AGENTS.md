@@ -4,7 +4,7 @@
 
 1. `ANDROID_RESCUE_README.md` — installation, operator workflow and options.
 2. `ARCHITECTURE.md` — code structure, state, acquisition flow and limitations.
-3. `android_rescue.py` — implementation, currently v2.1.0.
+3. `android_rescue.py` — implementation, currently v2.1.1.
 
 ## Scope
 
@@ -23,6 +23,6 @@ This directory is an independent Python ADB acquisition tool, not the parent pro
 
 - Check Python syntax and `--help`/`--version` without connecting to a phone; use `bash -n android-rescue.command` for launcher changes.
 - When changing acquisition/state logic, use simulated ADB fixtures to check selection, subtree copy, collisions, retry, resume and cancellation as applicable.
-- Resume currently skips done items when a local path exists; do not assume content verification or byte-offset restart.
+- Resume skips done items only after matching saved local size/SHA-256; old unverified items are recopied. Do not assume source-side verification, source-change detection or byte-offset restart.
 - Real-device claims require authorized-device evidence. Test USB/wireless transport, permissions, interruption and output integrity when affected. Never infer full-phone recoverability from mocks.
-- No automated test suite is included in this directory at review time. Report unavailable checks plainly.
+- Run `python3 -B -m unittest discover -s tests -v` in this directory. Report unavailable checks plainly.

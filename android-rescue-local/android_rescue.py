@@ -44,7 +44,7 @@ from collections import defaultdict
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 BATCH_SIZE = 32
 HASH_CHUNK = 4 * 1024 * 1024
 
@@ -230,10 +230,13 @@ def batched(items: Sequence[Tuple[str, str]], n: int) -> Iterator[Sequence[Tuple
 class Logger:
     def __init__(self, log_path: Path):
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.issues: List[str] = []
         self.log_path = log_path
         self.fp = log_path.open("a", encoding="utf-8", buffering=1)
 
     def log(self, message: str, level: str = "INFO") -> None:
+        if level == "ERROR":
+            self.issues.append(message)
         line = f"[{now_iso()}] [{level}] {message}"
         print(line, flush=True)
         self.fp.write(line + "\n")
@@ -282,8 +285,8 @@ class Adb:
         p = self.shell(command, timeout=timeout)
         out = p.stdout or ""
         err = p.stderr or ""
-        if p.returncode != 0 and err:
-            self.logger.log(f"shell command returned {p.returncode}: {command}: {err.strip()}", "WARN")
+        if p.returncode != 0:
+            self.logger.log(f"shell command returned {p.returncode}: {command}: {err.strip()}", "ERROR")
         return out
 
     def getprop(self, key: str) -> str:
@@ -410,6 +413,7 @@ class Adb:
 class StateDB:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.case = path.parent.parent
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -423,6 +427,11 @@ class StateDB:
                 error TEXT,
                 updated_at TEXT,
                 PRIMARY KEY (root_label, remote_path)
+            );
+            CREATE TABLE IF NOT EXISTS file_integrity (
+                local_rel TEXT PRIMARY KEY,
+                size_bytes INTEGER NOT NULL,
+                sha256 TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_storage_status ON storage_files(status);
 
@@ -440,6 +449,24 @@ class StateDB:
             """
         )
         self.conn.commit()
+
+    def remember_file(self, local_rel: str) -> None:
+        local = self.case / local_rel
+        self.conn.execute(
+            "INSERT OR REPLACE INTO file_integrity VALUES(?,?,?)",
+            (local_rel, local.stat().st_size, sha256_file(local)),
+        )
+
+    def verified_file(self, local_rel: str) -> bool:
+        row = self.conn.execute(
+            "SELECT size_bytes,sha256 FROM file_integrity WHERE local_rel=?", (local_rel,)
+        ).fetchone()
+        try:
+            local = self.case / local_rel
+            return bool(row and local.is_file() and local.stat().st_size == row[0]
+                        and sha256_file(local) == row[1])
+        except OSError:
+            return False
 
     def add_storage(self, root_label: str, remote: str, local_rel: str) -> None:
         self.conn.execute(
@@ -474,6 +501,10 @@ class StateDB:
             attempt += 1
 
     def set_storage(self, root_label: str, remote: str, status: str, error: Optional[str] = None) -> None:
+        if status == "done":
+            row = self.storage_row(root_label, remote)
+            if row:
+                self.remember_file(row[1])
         self.conn.execute(
             "UPDATE storage_files SET status=?,error=?,updated_at=? WHERE root_label=? AND remote_path=?",
             (status, error, now_iso(), root_label, remote),
@@ -510,6 +541,13 @@ class StateDB:
         )
 
     def set_artifact(self, kind: str, package: str, remote: str, status: str, error: Optional[str] = None) -> None:
+        if status == "done":
+            row = self.conn.execute(
+                "SELECT local_rel FROM app_artifacts WHERE kind=? AND package_name=? AND remote_path=?",
+                (kind, package, remote),
+            ).fetchone()
+            if row:
+                self.remember_file(row[0])
         self.conn.execute(
             "UPDATE app_artifacts SET status=?,error=?,updated_at=? WHERE kind=? AND package_name=? AND remote_path=?",
             (status, error, now_iso(), kind, package, remote),
@@ -665,9 +703,11 @@ def collect_metadata(adb: Adb, case: Path, logger: Logger) -> None:
     for idx, (name, cmd) in enumerate(commands.items(), 1):
         progress_line("Metadata", idx - 1, total, name)
         try:
-            capture_command(adb, meta / name, cmd)
+            result = capture_command(adb, meta / name, cmd)
+            if not result["ok"]:
+                logger.log(f"Metadata command failed for {name}: return code {result['returncode']}", "ERROR")
         except Exception as exc:
-            logger.log(f"Metadata command failed for {name}: {exc}", "WARN")
+            logger.log(f"Metadata command failed for {name}: {exc}", "ERROR")
             write_text(meta / name, f"ERROR: {exc}\n")
         progress_line("Metadata", idx, total, name)
     end_progress(f"Metadata: COMPLETE ({total} inventories/queries)")
@@ -727,7 +767,7 @@ def discover_storage_roots(adb: Adb, case: Path, logger: Logger) -> List[Dict[st
         for r in roots:
             logger.log(f"Readable storage root: {r['label']} -> {r['remote']}")
     else:
-        logger.log("No readable shared/external storage roots discovered", "WARN")
+        logger.log("No readable shared/external storage roots discovered", "ERROR")
     return roots
 
 
@@ -782,7 +822,7 @@ def queue_subtree(
 
     def scan_err(rc: int, err: str) -> None:
         if rc != 0 or err:
-            logger.log(f"{label}: subtree scan was partial (rc={rc}): {err[:500]}", "WARN")
+            logger.log(f"{label}: subtree scan was partial (rc={rc}): {err[:500]}", "ERROR")
 
     try:
         for d in adb.iter_find(remote_path, "d", scan_err):
@@ -804,7 +844,7 @@ def queue_subtree(
         raise
     except Exception as exc:
         db.commit()
-        logger.log(f"{label}: scan failed: {exc}", "WARN")
+        logger.log(f"{label}: scan failed: {exc}", "ERROR")
 
     if dir_count >= 1000 or file_count >= 500:
         end_progress(f"Scan {label}: COMPLETE — {file_count:,} files, {dir_count:,} directories")
@@ -819,7 +859,7 @@ def scan_root_catalog(adb: Adb, root: Dict[str, str], logger: Logger, display_la
 
     def scan_err(rc: int, err: str) -> None:
         if rc != 0 or err:
-            logger.log(f"Catalog scan for {root['remote']} was partial (rc={rc}): {err[:500]}", "WARN")
+            logger.log(f"Catalog scan for {root['remote']} was partial (rc={rc}): {err[:500]}", "ERROR")
 
     try:
         for path in adb.iter_find(root["remote"], "f", scan_err):
@@ -903,7 +943,7 @@ def discover_storage_files(adb: Adb, db: StateDB, case: Path, root: Dict[str, st
 
     def dir_err(rc: int, err: str) -> None:
         if rc != 0 or err:
-            logger.log(f"Directory scan for {remote_root} was partial (rc={rc}): {err[:500]}", "WARN")
+            logger.log(f"Directory scan for {remote_root} was partial (rc={rc}): {err[:500]}", "ERROR")
 
     try:
         for d in adb.iter_find(remote_root, "d", dir_err):
@@ -913,7 +953,7 @@ def discover_storage_files(adb: Adb, db: StateDB, case: Path, root: Dict[str, st
             if dir_count % 1000 == 0:
                 progress_line(f"Index dirs {label}", dir_count, 0, Path(d).name)
     except Exception as exc:
-        logger.log(f"Directory discovery failed for {remote_root}: {exc}", "WARN")
+        logger.log(f"Directory discovery failed for {remote_root}: {exc}", "ERROR")
     if dir_count >= 1000:
         end_progress(f"Index dirs {label}: {dir_count:,} found")
 
@@ -922,7 +962,7 @@ def discover_storage_files(adb: Adb, db: StateDB, case: Path, root: Dict[str, st
 
     def file_err(rc: int, err: str) -> None:
         if rc != 0 or err:
-            logger.log(f"File scan for {remote_root} was partial (rc={rc}): {err[:500]}", "WARN")
+            logger.log(f"File scan for {remote_root} was partial (rc={rc}): {err[:500]}", "ERROR")
 
     try:
         for f in adb.iter_find(remote_root, "f", file_err):
@@ -933,7 +973,7 @@ def discover_storage_files(adb: Adb, db: StateDB, case: Path, root: Dict[str, st
                 progress_line(f"Index files {label}", file_count, 0, Path(f).name)
         db.commit()
     except Exception as exc:
-        logger.log(f"File discovery failed for {remote_root}: {exc}", "WARN")
+        logger.log(f"File discovery failed for {remote_root}: {exc}", "ERROR")
         db.commit()
 
     if file_count >= 1000:
@@ -955,7 +995,7 @@ def fallback_pull_root(adb: Adb, case: Path, root: Dict[str, str], timeout: int,
     else:
         ok, msg = adb.pull_one(remote.rstrip("/") + "/.", dest, timeout)
     if ok:
-        logger.log(f"Fallback pull completed for {label}")
+        logger.log(f"Fallback pull completed for {label}, but per-file indexing and completeness were not verified", "ERROR")
     else:
         logger.log(f"Fallback pull failed/partial for {label}: {msg[-1000:]}", "ERROR")
 
@@ -986,7 +1026,7 @@ def acquire_storage_rows(
         # The row may have been queued earlier in this session; consult SQLite again
         # so a completed copy is never recopied merely because the in-memory row is stale.
         current_status = db.storage_status(label, remote) or status
-        if current_status == "done" and local.exists():
+        if current_status == "done" and db.verified_file(local_rel):
             skipped += 1
             continue
         pending.append((remote, local_rel))
@@ -1147,6 +1187,7 @@ def acquire_apks(adb: Adb, db: StateDB, case: Path, mode: str, timeout: int, log
         progress_line("APK inventory", i - 1, len(packages), pkg)
         p = adb.shell(f"pm path {shell_quote(pkg)}", timeout=60)
         if p.returncode != 0:
+            logger.log(f"APK path discovery failed for {pkg}: {p.stderr or p.stdout}", "ERROR")
             continue
         for line in (p.stdout or "").splitlines():
             line = line.strip()
@@ -1172,7 +1213,7 @@ def acquire_apks(adb: Adb, db: StateDB, case: Path, mode: str, timeout: int, log
     processed = 0
     for pkg, remote, local_rel, status in rows:
         local = case / local_rel
-        if status == "done" and local.exists():
+        if status == "done" and db.verified_file(local_rel):
             skipped += 1
             processed += 1
             progress_line("APK copy", processed, total_rows, f"skipped {pkg}")
@@ -1212,39 +1253,58 @@ def archive_debuggable_private_data(adb: Adb, case: Path, timeout: int, logger: 
             continue
 
         tar_path = out_dir / f"{safe_name(pkg)}.tar"
-        if tar_path.exists() and tar_path.stat().st_size > 0:
+        receipt = tar_path.with_suffix(".tar.complete.json")
+        try:
+            saved = json.loads(receipt.read_text())
+            reusable = (saved.get("size") == tar_path.stat().st_size
+                        and saved.get("sha256") == sha256_file(tar_path))
+        except (OSError, ValueError):
+            reusable = False
+        if reusable:
             status[pkg] = {"accessible": True, "archived": True, "path": str(tar_path.relative_to(case)), "resumed": True}
-            progress_line("App data probe", idx, len(packages), f"{pkg} (already archived)")
+            progress_line("App data probe", idx, len(packages), f"{pkg} (verified archive)")
             continue
+        receipt.unlink(missing_ok=True)
+        partial_path = tar_path.with_suffix(".tar.partial")
+        if tar_path.exists():
+            # An old archive without a valid success receipt must not look final.
+            tar_path.replace(partial_path)
 
         logger.log(f"run-as permitted for {pkg}; archiving its private app directory")
         try:
             rc, err = run_stream_to_file_with_progress(
                 adb.prefix + ["exec-out", "run-as", pkg, "tar", "-cf", "-", "."],
-                tar_path,
+                partial_path,
                 label=f"App data archive {pkg}",
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             rc, err = 124, f"archive timed out after {timeout}s"
         valid = False
-        if rc == 0 and tar_path.exists() and tar_path.stat().st_size > 0:
+        if rc == 0 and partial_path.exists() and partial_path.stat().st_size > 0:
             try:
-                with tarfile.open(tar_path, "r:*") as tf:
-                    # Validate that the archive has at least a readable TAR header without
-                    # loading a potentially huge member index into memory.
-                    tf.next()
+                # Stream every member and payload; a readable first header is insufficient.
+                with tarfile.open(partial_path, "r|*") as tf:
+                    for member in tf:
+                        if member.isfile():
+                            fp = tf.extractfile(member)
+                            if fp is not None:
+                                while fp.read(HASH_CHUNK):
+                                    pass
                 valid = True
             except Exception as exc:
                 err = f"Archive validation failed: {exc}; {err}".strip()
         if valid:
+            partial_path.replace(tar_path)
+            atomic_json(receipt, {"size": tar_path.stat().st_size, "sha256": sha256_file(tar_path)})
             status[pkg] = {"accessible": True, "archived": True, "path": str(tar_path.relative_to(case))}
         else:
             try:
-                tar_path.unlink(missing_ok=True)
+                partial_path.unlink(missing_ok=True)
             except Exception:
                 pass
             status[pkg] = {"accessible": True, "archived": False, "reason": err or f"tar returned {rc}"}
+            logger.log(f"Private archive failed for {pkg}: {status[pkg]['reason']}", "ERROR")
 
         if idx % 50 == 0:
             atomic_json(out_dir / "status.json", status)
@@ -1286,11 +1346,11 @@ def export_content_providers(adb: Adb, case: Path, logger: Logger) -> Dict[str, 
                 "note": "Provider may legitimately contain zero rows" if ok and not text.strip() else "",
             }
             if not ok:
-                logger.log(f"Provider {name} was not readable on this device (expected on many Android builds)", "WARN")
+                logger.log(f"Provider {name} was not readable on this device (expected on many Android builds)", "ERROR")
         except Exception as exc:
             status[name] = {"ok": False, "error": str(exc)}
             write_text(out_dir / f"{name}.txt", f"ERROR: {exc}\n")
-            logger.log(f"Provider export failed for {name}: {exc}", "WARN")
+            logger.log(f"Provider export failed for {name}: {exc}", "ERROR")
         progress_line("Providers", idx, total, name)
     atomic_json(out_dir / "status.json", status)
     readable = sum(1 for info in status.values() if info.get("ok"))
@@ -1306,14 +1366,14 @@ def run_bugreport(adb: Adb, case: Path, timeout: int, logger: Logger) -> None:
     try:
         rc = run_cancellable_passthrough(adb.prefix + ["bugreport", str(dest)], timeout=timeout)
     except subprocess.TimeoutExpired:
-        logger.log(f"Bugreport timed out after {timeout}s", "WARN")
+        logger.log(f"Bugreport timed out after {timeout}s", "ERROR")
         print("Bugreport: FAILED — timed out")
         return
     if rc == 0:
         logger.log("Bugreport completed")
         print("Bugreport: COMPLETE")
     else:
-        logger.log(f"Bugreport failed with adb return code {rc}", "WARN")
+        logger.log(f"Bugreport failed with adb return code {rc}", "ERROR")
         print(f"Bugreport: FAILED — adb return code {rc}")
 
 
@@ -1346,7 +1406,7 @@ def generate_hash_manifest(case: Path, logger: Logger) -> Tuple[int, int]:
     for root_name in roots_to_hash:
         root = case / root_name
         if root.exists():
-            files.extend(p for p in root.rglob("*") if p.is_file())
+            files.extend(p for p in root.rglob("*") if p.is_file() and not p.name.endswith(".partial"))
     files = sorted(set(files), key=lambda p: str(p.relative_to(case)))
 
     logger.log(f"Hashing {len(files):,} acquired files with SHA-256")
@@ -1364,15 +1424,17 @@ def generate_hash_manifest(case: Path, logger: Logger) -> Tuple[int, int]:
                 sum_fp.write(f"{digest}  {rel}\n")
                 total_bytes += stat.st_size
             except Exception as exc:
-                logger.log(f"Could not hash {path}: {exc}", "WARN")
+                raise RuntimeError(f"Could not hash {path}: {exc}") from exc
             progress_line("SHA-256", i, len(files), str(path.relative_to(case)))
     end_progress(f"SHA-256: COMPLETE — {len(files):,} files, {human_bytes(total_bytes)}")
     logger.log(f"Hash manifest complete: {len(files):,} files, {total_bytes / (1024**3):.2f} GiB")
     return len(files), total_bytes
 
 
-def write_failures_report(db: StateDB, case: Path) -> int:
+def write_failures_report(db: StateDB, case: Path, logger: Optional[Logger] = None) -> int:
     failures = db.failures()
+    if logger is not None:
+        failures.extend(("operation", "", "", issue) for issue in logger.issues)
     path = case / "reports" / "failures.csv"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fp:
@@ -1622,7 +1684,7 @@ def manual_browser(
         sys.stdout.write(f"\rRead {len(entries):,} item(s) from {current}\033[K\n")
         sys.stdout.flush()
         if errors:
-            logger.log(f"Browser listing for {current} was partial: {errors[-1][:500]}", "WARN")
+            logger.log(f"Browser listing for {current} was partial: {errors[-1][:500]}", "ERROR")
         return entries
 
     while True:
@@ -2014,6 +2076,7 @@ def main() -> int:
             pass
     hash_count: Optional[int] = None
     hash_bytes: Optional[int] = None
+    do_hash = not args.no_hash
 
     def handle_signal(signum, _frame):
         logger.log(f"Received signal {signum}; committing local resume state", "WARN")
@@ -2059,9 +2122,6 @@ def main() -> int:
             else:
                 logger.log("Bugreport skipped by --no-bugreport")
 
-            if not args.no_hash:
-                hash_count, hash_bytes = generate_hash_manifest(case, logger)
-
         else:
             print("\nPRIORITY MODE — discovering readable storage roots only; no bulk copy has started yet.\n")
             roots = discover_storage_roots(adb, case, logger)
@@ -2090,13 +2150,11 @@ def main() -> int:
                     except KeyboardInterrupt:
                         print("\nFinal hashing skipped.")
                         do_hash = False
-                if do_hash:
-                    hash_count, hash_bytes = generate_hash_manifest(case, logger)
-                else:
+                if not do_hash:
                     logger.log("Final hashing skipped at operator request")
 
         write_storage_path_map(db, case)
-        failures = write_failures_report(db, case)
+        failures = write_failures_report(db, case, logger)
         completed = now_iso()
         write_summary(
             case,
@@ -2121,6 +2179,15 @@ def main() -> int:
         acquisition_meta["failure_count"] = failures
         acquisition_meta["pending_count"] = pending
         atomic_json(acquisition_path, acquisition_meta)
+        # Discard any earlier selective hashes: metadata and acquired data may have changed.
+        if do_hash:
+            hash_count, hash_bytes = generate_hash_manifest(case, logger)
+        else:
+            hash_count = hash_bytes = None
+            for name in ("files.csv", "SHA256SUMS.txt"):
+                (case / "manifests" / name).unlink(missing_ok=True)
+        write_summary(case, identity, db, provider_status, hash_count, hash_bytes,
+                      failures, str(acquisition_meta["started"]), completed)
 
         print("\n" + "=" * 78)
         print("ANDROID RESCUE SESSION COMPLETE")
@@ -2135,12 +2202,12 @@ def main() -> int:
                 "Open items remain; inspect reports/failures.csv and rerun with --resume after restoring connectivity/access",
                 "WARN",
             )
-        return 0 if not failures else 2
+        return 2 if failures or pending else 0
 
     except KeyboardInterrupt:
         completed = now_iso()
         write_storage_path_map(db, case)
-        failures = write_failures_report(db, case)
+        failures = write_failures_report(db, case, logger)
         write_summary(
             case,
             identity,
@@ -2152,6 +2219,8 @@ def main() -> int:
             str(acquisition_meta["started"]),
             completed,
         )
+        for name in ("files.csv", "SHA256SUMS.txt"):
+            (case / "manifests" / name).unlink(missing_ok=True)
         acquisition_meta["status"] = "interrupted"
         acquisition_meta["completed"] = completed
         acquisition_meta["counts"] = db.counts()
@@ -2165,9 +2234,11 @@ def main() -> int:
     except Exception as exc:
         completed = now_iso()
         logger.log(f"Fatal error: {exc}", "ERROR")
+        for name in ("files.csv", "SHA256SUMS.txt"):
+            (case / "manifests" / name).unlink(missing_ok=True)
         try:
             write_storage_path_map(db, case)
-            failures = write_failures_report(db, case)
+            failures = write_failures_report(db, case, logger)
             write_summary(
                 case,
                 identity,
