@@ -40,7 +40,8 @@ public class MainActivity extends Activity {
     private CheckBox tls;
     private TextView status;
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final Runnable ticker = new Runnable() { public void run() { if(status!=null)status.setText("Status: " + BridgeService.getStatus()); handler.postDelayed(this,1000); } };
+    private String shownServiceStatus;
+    private final Runnable ticker = new Runnable() { public void run() { String s=BridgeService.getStatus(); if(status!=null&&!s.equals(shownServiceStatus)){shownServiceStatus=s;status.setText("Status: "+s);} handler.postDelayed(this,1000); } };
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -55,7 +56,7 @@ public class MainActivity extends Activity {
     private View buildUi() {
         int pad=dp(20), gap=dp(10);
         ScrollView scroll=new ScrollView(this); LinearLayout root=new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(pad,pad,pad,pad); scroll.addView(root);
-        root.setOnApplyWindowInsetsListener((v,insets)->{ if (Build.VERSION.SDK_INT >= 30) { android.graphics.Insets s=insets.getInsets(WindowInsets.Type.systemBars()); v.setPadding(pad,pad+s.top,pad,pad+s.bottom); } else { v.setPadding(pad,pad+insets.getSystemWindowInsetTop(),pad,pad+insets.getSystemWindowInsetBottom()); } return insets; });
+        scroll.setOnApplyWindowInsetsListener((v,insets)->{ if (Build.VERSION.SDK_INT >= 30) { android.graphics.Insets s=insets.getInsets(WindowInsets.Type.systemBars()); v.setPadding(s.left,s.top,s.right,s.bottom); } else { v.setPadding(insets.getSystemWindowInsetLeft(),insets.getSystemWindowInsetTop(),insets.getSystemWindowInsetRight(),insets.getSystemWindowInsetBottom()); } return insets; });
 
         TextView title=text("Rescue Bridge",26,true); root.addView(title);
         TextView intro=text("No account or sign-in. When you tap Enable Remote Rescue, this phone opens an authenticated outbound connection to your self-hosted relay. Android shows an ongoing notification while support is active. It does not auto-start after reboot.",15,false); add(root,intro,gap);
